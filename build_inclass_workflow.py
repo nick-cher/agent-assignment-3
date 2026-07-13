@@ -153,6 +153,12 @@ nodes.append({
     "type": "n8n-nodes-base.webhook",
     "typeVersion": 2,
     "position": pos(0, 1),
+    # n8n registers a PRODUCTION webhook only for a node that carries a
+    # webhookId. Without it, the workflow can be flipped to active (the flag is
+    # set in the DB) and POSTs to /webhook/smart-order-router still come back
+    # 404 "not registered". The editor mints this id when you save in the UI,
+    # which is why the toggle works there but a CLI activation does not.
+    "webhookId": nid("order-webhook"),
     "parameters": {
         "httpMethod": "POST",
         "path": "smart-order-router",
@@ -381,6 +387,13 @@ in_stock_set = set_node(
     }],
     7, 0,
 )
+# A Set node on typeVersion 3.x emits ONLY the fields it assigns unless told
+# otherwise, so this node was passing {action: "routed_primary"} downstream and
+# dropping `order`, `priority`, `inventory` and the rest of the item. "Log
+# Decision" then read j.order.order_id and threw "Cannot read properties of
+# undefined". That broke the entire in-stock path: only orders that fell through
+# to Alternative Sourcing (which spreads ...j) could reach the audit log.
+in_stock_set["parameters"]["includeOtherFields"] = True
 nodes.append(in_stock_set)
 
 # 10. Logging Code node — combines both branches
