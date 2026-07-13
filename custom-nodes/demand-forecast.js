@@ -23,9 +23,12 @@
  */
 
 // ---- Input contract -------------------------------------------------------
-// Upstream node provides items where item.json = {month, sku, name, units_sold}
-// (the parsed sales_history.csv).
-const sales = $input.all().map(i => i.json);
+// This node sits on a Switch branch, so $input is the Master Planner's plan
+// object, not the sales rows. We reach back to the CSV-parse node for the data,
+// the same way the provided "Build Shipping Requests" node pulls its catalogue
+// with $('Read Shipping JSON').
+// Rows look like {month, sku, name, units_sold} (the parsed sales_history.csv).
+const sales = $('Read Sales JSON').all().map(i => i.json);
 
 // ---- Helpers (provided — do not change) -----------------------------------
 
@@ -64,11 +67,14 @@ function nextMonth(monthStr) {
  * items — which is exactly why the seasonal index and the LLM step exist.
  */
 function movingAverage(series) {
-  // TODO [easy] — LO-3: classical baseline forecasting
-  //   1. Slice the last up-to-3 entries from `series`.
-  //   2. Sum their `units_sold` and divide by the count.
-  //   3. Return 0 for an empty series.
-  throw new Error("TODO [easy]: implement movingAverage()");
+  if (!series || series.length === 0) return 0;
+
+  // Take the most recent 3 months. slice(-3) yields the whole series when
+  // fewer than 3 months exist, so short histories average what they have.
+  const window = series.slice(-3);
+  const total = window.reduce((acc, r) => acc + Number(r.units_sold), 0);
+
+  return total / window.length;
 }
 
 /**
@@ -90,15 +96,28 @@ function movingAverage(series) {
  * @returns {number}            Multiplier. Default to 1.0 if you can't compute one.
  */
 function seasonalIndex(series, targetMonth) {
-  // TODO [medium] — LO-3: time-series decomposition
-  //   1. Extract the month-of-year part: targetMonth.split("-")[1] -> "01".."12"
-  //   2. Compute monthMean = mean of units_sold in `series` where the month
-  //      portion of row.month matches.
-  //   3. Compute overallMean = mean of units_sold across the entire series.
-  //   4. Return monthMean / overallMean. Guard against division by zero
-  //      (return 1.0 if overallMean is 0).
-  //   5. If no rows match the target month part, return 1.0.
-  throw new Error("TODO [medium]: implement seasonalIndex()");
+  if (!series || series.length === 0) return 1.0;
+
+  // "2026-01" -> "01". Only the month-of-year matters; the year is discarded
+  // so that every January in the history contributes to January's index.
+  const monthOfYear = targetMonth.split("-")[1];
+
+  const sameMonth = series.filter(r => String(r.month).split("-")[1] === monthOfYear);
+
+  // No observation for that calendar month: we have no seasonal evidence, so
+  // stay neutral rather than inventing a multiplier.
+  if (sameMonth.length === 0) return 1.0;
+
+  const mean = rows =>
+    rows.reduce((acc, r) => acc + Number(r.units_sold), 0) / rows.length;
+
+  const monthMean = mean(sameMonth);
+  const overallMean = mean(series);
+
+  // A dead SKU (zero sales all year) has no meaningful ratio.
+  if (overallMean === 0) return 1.0;
+
+  return monthMean / overallMean;
 }
 
 // ---- Main loop (provided) -------------------------------------------------
@@ -125,6 +144,52 @@ for (const sku of Object.keys(bySku)) {
   const cv = ma > 0 ? Math.sqrt(variance) / ma : 1;
   const confidence = Math.max(0, Math.min(1, 1 - cv));
 
+  // Contextual notes for the downstream LLM adjuster.
+  //
+  // The aggregates above are lossy on purpose: a moving average collapses the
+  // SHAPE of the series into a single level. A SKU ramping 5x over three months
+  // and a flat SKU can share a moving average, and the adjuster sees only the
+  // aggregate — so on its own it cannot tell a viral product from a stable one.
+  // We hand it a compact trend summary instead of all 12 rows, which would
+  // multiply the token bill across every SKU on this branch.
+  const units = series.map(r => Number(r.units_sold));
+  const mean = a => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
+
+  const notes = [`last_6_months=[${units.slice(-6).join(", ")}]`];
+
+  // Two orthogonal views of the trend. We deliberately hand the LLM raw ratios
+  // rather than a "cleaned" signal, for a reason worth stating:
+  //
+  // We cannot deseasonalize our way out of this. With 12 months of history each
+  // calendar month appears exactly once, so seasonalIndex(m) degenerates to
+  // units(m) / seriesMean — and dividing each month by that index returns the
+  // series mean for every month. The ratio flattens to 1.0 for every SKU and
+  // the signal is gone. Trend and seasonality are simply not identifiable from
+  // one SKU's 12 points; separating them needs multiple years, or a peer group,
+  // or knowledge of what the product IS.
+  //
+  // That last one is exactly what the LLM has and the arithmetic does not. It
+  // knows a snow boot climbing into January is a season, and wool gloves at 6x
+  // is not. So the honest division of labour: the code reports what moved, the
+  // model judges whether that movement is ordinary for this product this month.
+  const recent3 = mean(units.slice(-3));
+  const prior9 = mean(units.slice(0, -3));
+  const first3 = mean(units.slice(0, 3));
+
+  // Spike: recent quarter against the rest of the year. High for a genuine ramp,
+  // but ALSO high for any product entering its high season.
+  if (prior9 > 0) {
+    notes.push(`spike_ratio_recent3_vs_prior9=${Math.round((recent3 / prior9) * 100) / 100}`);
+  }
+
+  // Year trend: end of the year against the start. A cyclical product returns to
+  // where it began (~1.0) because both ends sit in its off-season. A product in
+  // true structural decline ends far below where it started. This is the ratio
+  // that separates "December" from "dying".
+  if (first3 > 0) {
+    notes.push(`year_trend_last3_vs_first3=${Math.round((recent3 / first3) * 100) / 100}`);
+  }
+
   results.push({
     sku,
     name: series[0].name,
@@ -134,7 +199,7 @@ for (const sku of Object.keys(bySku)) {
     seasonal_index: Math.round(si * 100) / 100,
     statistical_confidence: Math.round(confidence * 100) / 100,
     method: "moving_avg_3 × seasonal_index",
-    notes: [],
+    notes,
   });
 }
 

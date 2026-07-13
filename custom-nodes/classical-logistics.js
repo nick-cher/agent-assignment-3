@@ -25,9 +25,33 @@
 //              destination_region, transit_days, cost_per_kg,
 //              max_weight_kg, supports_perishable }
 
-const all = $input.all().map(i => i.json);
-const requests = all.filter(x => x.type === "request");
-const options  = all.filter(x => x.type === "option");
+// $input here is whatever the IF node passed through — the Logistics LLM's raw
+// response envelopes, not the requests themselves. The IF forwards exactly those
+// requests the LLM flagged as purely numeric, so the envelopes tell us WHICH
+// requests were handed to us; we then fetch the real data from the nodes that
+// own it.
+const routedIds = new Set(
+  $input.all()
+    .map(i => {
+      try {
+        const text = i.json.content[0].text.replace(/```(?:json)?/g, "").trim();
+        return JSON.parse(text).request_id;
+      } catch (e) {
+        return null;
+      }
+    })
+    .filter(Boolean)
+);
+
+const allRequests = $('Build Shipping Requests').all().map(i => i.json);
+
+// Re-plan only what was routed here. Falling back to the full set keeps the node
+// runnable standalone (Execute Node) when there is no upstream IF output to read.
+const requests = routedIds.size
+  ? allRequests.filter(r => routedIds.has(r.request_id))
+  : allRequests;
+
+const options = $('Read Shipping JSON').all().map(i => i.json);
 
 // ---- TODO — greedy carrier assignment -------------------------------------
 
@@ -58,8 +82,44 @@ const options  = all.filter(x => x.type === "option");
  * the LLM branch, not because we couldn't afford the optimal search.
  */
 function pickCheapestFeasible(req, options) {
-  // TODO [hard] — LO-2: classical search baselines
-  throw new Error("TODO [hard]: implement pickCheapestFeasible()");
+  // Step 1 — feasibility. These are HARD constraints: an option either satisfies
+  // all of them or it is not a candidate at all. There is no trading a day of
+  // lateness against a cheaper rate here; that kind of judgement is exactly what
+  // the LLM branch is for. This branch is the deterministic, auditable one.
+  const feasible = options.filter(opt => {
+    if (opt.origin_region !== req.origin_region) return false;
+    if (opt.destination_region !== req.dest_region) return false;
+    if (Number(opt.transit_days) > Number(req.deadline_days)) return false;
+    if (Number(opt.max_weight_kg) < Number(req.weight_kg)) return false;
+
+    // Perishable cargo may only ride a carrier that supports it. The CSV parses
+    // this column as the strings "true"/"false", so compare loosely rather than
+    // trusting a boolean to have survived the trip.
+    if (req.perishable === true) {
+      const supports =
+        opt.supports_perishable === true || opt.supports_perishable === "true";
+      if (!supports) return false;
+    }
+    return true;
+  });
+
+  // Step 2 — infeasible is a real answer, not an error. REQ-002 (60kg, perishable,
+  // 3-day deadline) has no carrier: the only perishable-capable North America
+  // lane is UPS Ground at 5 days. Returning null lets the caller report "no
+  // feasible carrier" instead of inventing one that breaks a hard constraint.
+  if (feasible.length === 0) return null;
+
+  // Step 3 — greedy: among the survivors, take the cheapest. Cost is linear in
+  // weight, so the per-kg rate decides it. With ~10 options the exhaustive search
+  // IS this search; greedy is not an approximation here, it is optimal. We use it
+  // because it is a clean, explainable baseline to hold the LLM's plan against.
+  return feasible
+    .map(opt => ({
+      ...opt,
+      total_cost_usd:
+        Math.round(Number(req.weight_kg) * Number(opt.cost_per_kg) * 100) / 100,
+    }))
+    .reduce((best, opt) => (opt.total_cost_usd < best.total_cost_usd ? opt : best));
 }
 
 // ---- Main loop (provided) -------------------------------------------------

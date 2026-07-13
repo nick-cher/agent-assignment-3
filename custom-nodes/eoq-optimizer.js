@@ -26,9 +26,15 @@
  * Reading: docs/planning-primer.md §"STRIPS-style assumptions and where they break"
  */
 
-// Inputs are merged upstream from two reads — inventory and sales — so this
-// node sees a heterogeneous list. Partition them by which fields are present.
-const all = $input.all().map(i => i.json);
+// This node sits on a Switch branch, so $input carries the Master Planner's
+// plan object rather than any data rows. We pull the two datasets directly from
+// the CSV-parse nodes, mirroring the provided "Build Shipping Requests" node.
+// The list is deliberately heterogeneous — inventory rows carry `on_hand`,
+// sales rows carry `units_sold` — and partition() splits them apart below.
+const all = [
+  ...$('Read Inventory JSON').all().map(i => i.json),
+  ...$('Read Sales JSON').all().map(i => i.json),
+];
 
 // Default ordering cost (S in the EOQ formula). In production this would
 // vary by supplier and channel; we hard-code a single value so the focus
@@ -66,8 +72,16 @@ function annualDemand(salesForSku) {
  *       and dividing by zero holding cost is meaningless.)
  */
 function eoq(D, S, H) {
-  // TODO [medium] — LO-2: classical optimization
-  throw new Error("TODO [medium]: implement eoq()");
+  // No demand means there is no batch worth optimizing, and a zero holding cost
+  // makes the ratio meaningless (the formula would divide by zero and imply an
+  // infinite order). Both are outside the model's domain, so refuse rather than
+  // return a number that looks authoritative.
+  if (!D || D <= 0) return 0;
+  if (!H || H <= 0) return 0;
+
+  // Wilson (1934): the quantity where annual ordering cost and annual holding
+  // cost are equal, which is where their sum is minimized.
+  return Math.round(Math.sqrt((2 * D * S) / H));
 }
 
 // ---- TODO #2 — assumption-violation detection -----------------------------
@@ -101,8 +115,93 @@ function eoq(D, S, H) {
  *       trigger multiple flags — that's expected and useful downstream.
  */
 function detectViolations(inv, salesSeries) {
-  // TODO [hard] — LO-4: knowing when classical models fail
-  throw new Error("TODO [hard]: implement detectViolations()");
+  const flags = [];
+  if (!salesSeries || salesSeries.length === 0) return flags;
+
+  const units = salesSeries.map(r => Number(r.units_sold));
+  const mean = a => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
+
+  const recent3 = mean(units.slice(-3));   // the quarter we are ordering for
+  const prior9  = mean(units.slice(0, -3)); // the rest of the year
+  const first3  = mean(units.slice(0, 3));  // where the year started
+  const D = annualDemand(salesSeries);
+
+  // (a) "demand is roughly constant" — broken upward.
+  //
+  // Threshold 2.5 is chosen against the data, not plucked from the air. Every
+  // winter SKU (jackets, beanies, boots, blankets) ramps into Q4 at ~2.4x its
+  // own annual baseline, and that is ordinary seasonality that EOQ's annual
+  // demand figure already absorbs. Wool Gloves runs at ~6.2x. Setting the bar at
+  // 2.5 puts it above routine seasonality and below the genuine viral event, so
+  // the flag fires for the real anomaly and stays quiet for the other four.
+  if (prior9 > 0 && recent3 > 2.5 * prior9) {
+    flags.push("viral_spike");
+  }
+
+  // (b) "demand is roughly constant" — broken downward.
+  //
+  // Compared against the START of the year, not the rest of it. That choice is
+  // what separates a dying product from a seasonal one. A summer SKU in December
+  // has collapsed relative to its recent months, but it ends the year roughly
+  // where it began (~1.3x) because January is also its off-season — it is not
+  // dying, it is winter. A structurally declining SKU ends far below its own
+  // January (Wired Earbuds: 0.41x). Comparing to prior9 instead would flag every
+  // seasonal product in the catalogue.
+  if (first3 > 0 && recent3 < 0.5 * first3) {
+    flags.push("declining");
+  }
+
+  // (c) "an optimal batch is meaningful" — broken by thin volume.
+  //
+  // Under ~5 units/month the sqrt is dominated by noise: one lumpy month moves
+  // Q* enough to make the "optimum" arbitrary. Better to admit the model has
+  // nothing useful to say than to ship a precise-looking number.
+  if (D < 60) {
+    flags.push("low_velocity");
+  }
+
+  // (d) "replenishment is instantaneous" — broken by a long, risky lead time.
+  //
+  // EOQ has no lead-time term at all: it assumes stock appears when ordered. A
+  // long lead time only actually hurts when demand is also volatile, because a
+  // steady seller can be covered by a reorder point. Volatility is measured with
+  // the coefficient of variation so it is scale-free and comparable across SKUs
+  // selling 5 or 500 units.
+  const avg = mean(units);
+  const sd = avg > 0
+    ? Math.sqrt(mean(units.map(u => Math.pow(u - avg, 2))))
+    : 0;
+  const cv = avg > 0 ? sd / avg : 0;
+  if (Number(inv.lead_time_days) > 28 && cv > 0.5) {
+    flags.push("long_lead_time");
+  }
+
+  // (e) Dead stock: a glut that demand will never come back to clear.
+  //
+  // Note what this check is NOT. A naive "on_hand > 5x reorder_point" flag looks
+  // reasonable and is badly wrong on this catalogue: it fires on Sunglasses,
+  // Beach Towel and Swim Trunks, which are simply summer SKUs holding stock
+  // through their off-season. By months-of-cover they are indistinguishable from
+  // the genuinely dead SKU — Sunglasses carries 6.9 months, Wired Earbuds 6.8.
+  //
+  // The pile size is not the signal. What matters is whether demand is coming
+  // back for it. A seasonal glut clears itself next season; a glut on a decaying
+  // product never clears and only accrues holding cost. So overstock is only a
+  // violation IN CONJUNCTION with decline, and that conjunction is the thing
+  // worth routing to a human-style judgement.
+  const onHand = Number(inv.on_hand);
+  const rop = Number(inv.reorder_point);
+  const overstocked = rop > 0 && onHand > 5 * rop;
+  if (overstocked && flags.includes("declining")) {
+    flags.push("dead_stock");
+  }
+
+  // Deliberately NOT implemented: perishability. EOQ's holding cost is linear in
+  // time, which is wrong for anything with a shelf life (spoilage is a cliff, not
+  // a slope). None of the 15 demo SKUs are perishable and the dataset carries no
+  // expiry field, so a check here could never fire. Noted in analysis.md.
+
+  return flags;
 }
 
 // ---- Main loop (provided) -------------------------------------------------

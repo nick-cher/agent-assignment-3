@@ -1,6 +1,11 @@
 services:
   n8n:
-    image: docker.n8n.io/n8nio/n8n:latest
+    # Pinned to the version this assignment was authored and verified against
+    # (docs/setup.md §1). On :latest (2.29.x) the engine executes the four
+    # parallel CSV-read branches depth-first, so "Build Context Summary" fires
+    # after the first branch and its cross-node references ($('Read Sales JSON'))
+    # throw "hasn't been executed". 2.19.5 waits for all four branches.
+    image: docker.n8n.io/n8nio/n8n:2.19.5
     container_name: n8n
     restart: unless-stopped
     ports:
@@ -30,6 +35,12 @@ services:
       # Allow {{ $env.X }} in node expressions. Off by default in n8n for
       # multi-tenant safety; fine to enable on a single-user local dev box.
       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+
+      # n8n >= 2.2x sandboxes the Read/Write File node to /home/node/.n8n-files
+      # by default. The workflow's four "Read ... File" nodes read the bind-mounted
+      # CSVs at /data, so that path has to be allow-listed or every read throws
+      # "Access to the file is not allowed."
+      - N8N_RESTRICT_FILE_ACCESS_TO=/data;/home/node/.n8n-files
     volumes:
       - n8n_data:/home/node/.n8n
       - ./workflows:/workflows:ro
