@@ -5,7 +5,7 @@
 
 ## Demo video
 
-(link to be added)
+https://www.loom.com/share/b0003ee3b9ba471eba70532f63704323
 
 ---
 
